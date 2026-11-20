@@ -1,0 +1,47 @@
+RBAC design for zbp ui
+===
+
+CREATE TABLE roles (
+    role_code VARCHAR(50) PRIMARY KEY,
+    name VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE role_permissions (
+    role_code VARCHAR(50) NOT NULL REFERENCES roles(role_code),
+    permission VARCHAR(100) NOT NULL,
+    PRIMARY KEY (role_code, permission)
+);
+
+CREATE TABLE app_users (
+    tenant_id UUID NOT NULL,
+    object_id UUID NOT NULL,
+    role_code VARCHAR(50) NOT NULL REFERENCES roles(role_code),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    PRIMARY KEY (tenant_id, object_id)
+);
+
+
+These routes are relative to the configured billing API base URL. All require the billing API access token and backend permission checks. Responses should use Cache-Control: no-store; errors should have a safe message field.
+
+Method and route	   Permission	            Purpose
+GET /access/me	   Authenticated active user	
+
+{
+  "role": "billing_agent",
+  "permissions": ["invoices.read", "adjustment.create"]
+}
+
+
+
+For example, billing_agent could have invoices.read and adjustments.create, while viewer only has invoices.read. Use Entra’s immutable tenant and object IDs to identify the user.
+
+After sign-in, the UI calls GET /access/me and receives:
+
+{
+  "role": "billing_agent",
+  "permissions": ["invoices.read", "adjustment.create"]
+}
+
+
+The UI can then show or enable a button based on permissions.includes("adjustments.create"). The API must independently check that permission when the button’s endpoint is called; disabling a button alone does not secure the operation.
+

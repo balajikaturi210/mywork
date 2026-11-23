@@ -10,29 +10,49 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * Reads and writes the jpm_stub_scenario table: ONE ROW PER CARD (last four digits); card '*' is the default row.
- * The row holds only what the request cannot supply: HTTP statuses (authorize / capture / refund) and the JSON fragments (responseStatus,
- * responseCode, responseMessage, ...) that are added to the request-based response. Read on every request.
+ * Reads and writes the jpm_stub_scenario table. One row = what the stub does, and the complete JSON it answers
+ * with, when a card ending in card_last4 reaches a step (AUTHORIZE or CAPTURE); card '*' is the default row. The stub reads the table on every request, so a changed row
+ * takes effect at once and is shared by all pods.
  */
 @Repository
 @ConditionalOnProperty(name = "chase.stub.enabled", havingValue = "true", matchIfMissing = true)
 public class ScenarioRepository {
 
-    /** the card_last4 of the default row */
+    public enum Step { AUTHORIZE, CAPTURE, REFUND }
+
+    /** AUTHORIZE: APPROVE | DECLINE | NONE;  CAPTURE: APPLY | NONE;  REFUND: APPLY | DECLINE | NONE */
+    public enum Effect { APPROVE, DECLINE, APPLY, NONE }
+
+    /** the card_last4 that holds the default (every other card) rows */
     public static final String DEFAULT_CARD = "*";
 
-    /** authJson / captureJson / refundJson: a JSON object with the response fields not taken from the request; null = default row's */
-    public record Scenario(String cardLast4, int authHttpStatus, String authJson, int approvedPercent,
-                           int captureHttpStatus, String captureJson, int refundHttpStatus, String refundJson,
-                           boolean lostResponse, int delayMs, String note) {
+    /**
+     * one table row. responseJson is the COMPLETE response body (with ${placeholders}); null = use the default row's.
+     */
+    public record Scenario(String cardLast4, Step step, Effect effect, int httpStatus, int approvedPercent,
+                           int delayMs, String responseJson, String note) {
 
         public Scenario {
             if (cardLast4 == null || !(cardLast4.equals(DEFAULT_CARD) || cardLast4.matches("\\d{4}"))) {
                 throw new IllegalArgumentException("card_last4 must be 4 digits (or * for the default row)");
             }
-            if (authHttpStatus < 100 || authHttpStatus > 599 || captureHttpStatus < 100 || captureHttpStatus > 599
-                    || refundHttpStatus < 100 || refundHttpStatus > 599) {
-                throw new IllegalArgumentException("http status must be 100-599");
+            if (step == null || effect == null) {
+                throw new IllegalArgumentException("step (AUTHORIZE|CAPTURE|REFUND) and effect are required");
+            }
+            boolean ok = switch (step) {
+                case AUTHORIZE -> effect == Effect.APPROVE || effect == Effect.DECLINE || effect == Effect.NONE;
+                case CAPTURE -> effect == Effect.APPLY || effect == Effect.NONE;
+                case REFUND -> effect == Effect.APPLY || effect == Effect.DECLINE || effect == Effect.NONE;
+            };
+            if (!ok) {
+                throw new IllegalArgumentException(switch (step) {
+                    case AUTHORIZE -> "effect for AUTHORIZE must be APPROVE, DECLINE or NONE";
+                    case CAPTURE -> "effect for CAPTURE must be APPLY or NONE";
+                    case REFUND -> "effect for REFUND must be APPLY, DECLINE or NONE";
+                });
+            }
+            if (httpStatus < 100 || httpStatus > 599) {
+                throw new IllegalArgumentException("httpStatus must be 100-599");
             }
             if (approvedPercent < 1 || approvedPercent > 100) {
                 throw new IllegalArgumentException("approvedPercent must be 1-100");
@@ -40,37 +60,19 @@ public class ScenarioRepository {
             if (delayMs < 0 || delayMs > 60000) {
                 throw new IllegalArgumentException("delayMs must be 0-60000");
             }
-            checkJson(authJson, "authJson");
-            checkJson(captureJson, "captureJson");
-            checkJson(refundJson, "refundJson");
-            if (cardLast4.equals(DEFAULT_CARD) && (isBlank(authJson) || isBlank(captureJson) || isBlank(refundJson))) {
-                throw new IllegalArgumentException("the default row needs authJson, captureJson and refundJson");
-            }
-            if (authHttpStatus >= 400 && isBlank(authJson)) {
-                throw new IllegalArgumentException("authJson is required when authHttpStatus is an error");
-            }
-            if (captureHttpStatus >= 400 && isBlank(captureJson)) {
-                throw new IllegalArgumentException("captureJson is required when captureHttpStatus is an error");
-            }
-            if (refundHttpStatus >= 400 && isBlank(refundJson)) {
-                throw new IllegalArgumentException("refundJson is required when refundHttpStatus is an error");
-            }
-        }
-
-        private static boolean isBlank(String s) {
-            return s == null || s.isBlank();
-        }
-
-        private static void checkJson(String s, String name) {
-            if (!isBlank(s) && !(s.strip().startsWith("{") && s.strip().endsWith("}"))) {
-                throw new IllegalArgumentException(name + " must be a JSON object ({ ... })");
+            if (responseJson != null && !responseJson.isBlank()) {
+                String t = responseJson.strip();
+                if (!t.startsWith("{") || !t.endsWith("}")) {
+                    throw new IllegalArgumentException("responseJson must be a JSON object ({ ... })");
+                }
+            } else if (effect == Effect.DECLINE || effect == Effect.NONE || httpStatus >= 400) {
+                throw new IllegalArgumentException("responseJson is required for DECLINE, NONE and error rows");
             }
         }
     }
 
     private static final String COLUMNS = """
-            card_last4, auth_http_status, auth_json, approved_percent, capture_http_status, capture_json,
-            refund_http_status, refund_json, lost_response, delay_ms, note
+            card_last4, step, effect, http_status, approved_percent, delay_ms, response_json, note
             """;
 
     private final JdbcTemplate jdbcTemplate;
@@ -80,86 +82,80 @@ public class ScenarioRepository {
         this.jdbcTemplate = jdbcTemplate;
     }
 
-    /** the row for a card, or empty */
-    public Optional<Scenario> find(String cardLast4) {
+    /** the scenario for a card at a step, or empty = normal approval */
+    public Optional<Scenario> find(String cardLast4, Step step) {
 
-        String sql = "SELECT " + COLUMNS + " FROM jpm_stub_scenario WHERE card_last4 = ?";
+        String sql = "SELECT " + COLUMNS + " FROM jpm_stub_scenario WHERE card_last4 = ? AND step = ?";
 
-        List<Scenario> rows = jdbcTemplate.query(sql, (rs, rowNum) -> map(rs), cardLast4);
+        List<Scenario> rows = jdbcTemplate.query(sql, (rs, rowNum) -> map(rs), cardLast4, step.name());
         return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
     }
 
     public List<Scenario> findAll() {
 
-        String sql = "SELECT " + COLUMNS + " FROM jpm_stub_scenario ORDER BY card_last4";
+        String sql = "SELECT " + COLUMNS + " FROM jpm_stub_scenario ORDER BY card_last4, step";
 
         return jdbcTemplate.query(sql, (rs, rowNum) -> map(rs));
     }
 
-    /** insert the row, or replace it when the card is already there */
+    /** insert the row, or replace it when the card/step is already there */
     @Transactional
     public void upsert(Scenario s) {
 
         String updateSql = """
                 UPDATE jpm_stub_scenario
-                SET auth_http_status = ?,
-                    auth_json = ?,
+                SET effect = ?,
+                    http_status = ?,
                     approved_percent = ?,
-                    capture_http_status = ?,
-                    capture_json = ?,
-                    refund_http_status = ?,
-                    refund_json = ?,
-                    lost_response = ?,
                     delay_ms = ?,
+                    response_json = ?,
                     note = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE card_last4 = ?
+                  AND step = ?
                 """;
 
         int updated = jdbcTemplate.update(updateSql,
-                s.authHttpStatus(), s.authJson(), s.approvedPercent(), s.captureHttpStatus(), s.captureJson(),
-                s.refundHttpStatus(), s.refundJson(), s.lostResponse() ? "Y" : "N", s.delayMs(), s.note(), s.cardLast4());
+                s.effect().name(), s.httpStatus(), s.approvedPercent(), s.delayMs(), s.responseJson(), s.note(),
+                s.cardLast4(), s.step().name());
 
         if (updated == 0) {
             String insertSql = """
                     INSERT INTO jpm_stub_scenario (
-                        card_last4, auth_http_status, auth_json, approved_percent, capture_http_status,
-                        capture_json, refund_http_status, refund_json, lost_response, delay_ms, note, updated_at
+                        card_last4, step, effect, http_status, approved_percent, delay_ms, response_json, note,
+                        updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """;
 
             jdbcTemplate.update(insertSql,
-                    s.cardLast4(), s.authHttpStatus(), s.authJson(), s.approvedPercent(), s.captureHttpStatus(),
-                    s.captureJson(), s.refundHttpStatus(), s.refundJson(), s.lostResponse() ? "Y" : "N", s.delayMs(),
-                    s.note());
+                    s.cardLast4(), s.step().name(), s.effect().name(), s.httpStatus(), s.approvedPercent(),
+                    s.delayMs(), s.responseJson(), s.note());
         }
     }
 
     /** @return true if a row was removed */
     @Transactional
-    public boolean delete(String cardLast4) {
+    public boolean delete(String cardLast4, Step step) {
 
         String sql = """
                 DELETE FROM jpm_stub_scenario
                 WHERE card_last4 = ?
+                  AND step = ?
                 """;
 
-        return jdbcTemplate.update(sql, cardLast4) > 0;
+        return jdbcTemplate.update(sql, cardLast4, step.name()) > 0;
     }
 
     private static Scenario map(java.sql.ResultSet rs) throws java.sql.SQLException {
         return new Scenario(
                 rs.getString("card_last4"),
-                rs.getInt("auth_http_status"),
-                rs.getString("auth_json"),
+                Step.valueOf(rs.getString("step")),
+                Effect.valueOf(rs.getString("effect")),
+                rs.getInt("http_status"),
                 rs.getInt("approved_percent"),
-                rs.getInt("capture_http_status"),
-                rs.getString("capture_json"),
-                rs.getInt("refund_http_status"),
-                rs.getString("refund_json"),
-                "Y".equals(rs.getString("lost_response")),
                 rs.getInt("delay_ms"),
+                rs.getString("response_json"),
                 rs.getString("note"));
     }
 }
